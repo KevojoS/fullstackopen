@@ -1,0 +1,199 @@
+import serial
+import time
+import keyboard
+import numpy as np
+from collections import deque, Counter
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+PORT               = 'COM4'
+BAUD_RATE          = 9600
+WINDOW_SIZE        = 24
+NUM_FEATURES       = 12
+DEBOUNCE_N         = 3
+CONF_THRESHOLD     = 0.6
+PREDICT_EVERY      = 6
+STILL_THRESHOLD    = 2.0   # gyro_std below this → idle
+CHAOTIC_THRESHOLD  = 18.0  # gyro_std above this → random movement
+
+# Column order (must match Arduino output):
+# w_gx, w_gy, w_gz, w_ax, w_ay, w_az, s_gx, s_gy, s_gz, s_ax, s_ay, s_az
+
+# ─────────────────────────────────────────────
+# NOTHING DETECTION
+# ─────────────────────────────────────────────
+def is_nothing(window: np.ndarray) -> bool:
+    """
+    True if window is too still (idle) or too chaotic (random motion).
+    Real reps live between STILL_THRESHOLD and CHAOTIC_THRESHOLD.
+    Tune by printing gyro_std live — see debug flag below.
+    """
+    w_gx = window[:, 0]
+    w_gy = window[:, 1]
+    gyro_std = np.std(w_gx) + np.std(w_gy)
+
+    return gyro_std < STILL_THRESHOLD or gyro_std > CHAOTIC_THRESHOLD
+
+# ─────────────────────────────────────────────
+# RULE-BASED CLASSIFIER
+# ─────────────────────────────────────────────
+def classify_window(window: np.ndarray) -> str:
+    """
+    Decision tree trained on your data (76% accuracy).
+    Only called when is_nothing() returns False.
+    """
+    w_ax = window[:, 3]
+    w_ay = window[:, 4]
+    w_az = window[:, 5]
+    s_ax = window[:, 9]
+    s_az = window[:, 11]
+
+    w_ax_mean  = w_ax.mean()
+    w_ay_mean  = w_ay.mean()
+    w_az_mean  = w_az.mean()
+    w_ay_std   = w_ay.std()
+    w_az_std   = w_az.std()
+    w_ay_range = w_ay.max() - w_ay.min()
+    w_az_range = w_az.max() - w_az.min()
+    s_ax_mean  = s_ax.mean()
+    s_ax_std   = s_ax.std()
+    s_az_mean  = s_az.mean()
+
+    if s_az_mean <= 2.73:
+        if w_ax_mean <= -8.19:
+            if w_ay_std <= 1.47:
+                return "pushup good"
+            else:
+                return "pushup bad" if w_ay_std <= 2.37 else "pushup good"
+        else:
+            if s_ax_std <= 1.98:
+                return "pushup bad"
+            else:
+                return "curl good" if w_az_std <= 1.41 else "curl bad"
+    else:
+        if w_az_mean <= 3.92:
+            if w_az_range <= 2.25:
+                return "curl good"
+            else:
+                return "pushup good" if w_ax_mean <= -8.39 else "curl bad"
+        else:
+            if w_ay_range <= 3.64:
+                return "curl bad" if s_ax_mean <= -8.94 else "pushup bad"
+            else:
+                return "curl good" if w_az_std <= 0.41 else "curl bad"
+
+# ─────────────────────────────────────────────
+# COMBINED PREDICT
+# ─────────────────────────────────────────────
+def predict(window: np.ndarray) -> str:
+    if is_nothing(window):
+        return "nothing"
+    return classify_window(window)
+
+# ─────────────────────────────────────────────
+# PARSE SERIAL LINE
+# ─────────────────────────────────────────────
+def parse_line(raw: str):
+    try:
+        parts = raw.split(",")
+        if len(parts) != NUM_FEATURES:
+            return None
+        values = [float(p.strip()) for p in parts]
+        arr = np.array(values, dtype=np.float32)
+        if not np.isfinite(arr).all():
+            return None
+        return arr
+    except (ValueError, IndexError):
+        return None
+
+# ─────────────────────────────────────────────
+# DEBOUNCE
+# ─────────────────────────────────────────────
+recent_preds = deque(maxlen=DEBOUNCE_N)
+last_printed = None
+
+def debounce(label: str) -> bool:
+    global last_printed
+    recent_preds.append(label)
+
+    if len(recent_preds) < DEBOUNCE_N:
+        return False
+
+    counts              = Counter(recent_preds)
+    top_label, top_count = counts.most_common(1)[0]
+    confidence          = top_count / DEBOUNCE_N
+
+    if confidence >= CONF_THRESHOLD and top_label != last_printed:
+        last_printed = top_label
+        return True
+
+    return False
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
+DEBUG_GYRO  = False  # set True to print gyro_std every frame for calibration
+
+buffer      = deque(maxlen=WINDOW_SIZE)
+frame_count = 0
+
+print(f"Connecting to {PORT} at {BAUD_RATE} baud...")
+
+try:
+    bt = serial.Serial(PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print("Connected — waiting for data. Press ESC to quit.\n")
+
+    while True:
+        if keyboard.is_pressed('esc'):
+            print("ESC pressed. Exiting...")
+            break
+
+        if bt.in_waiting == 0:
+            continue
+
+        raw     = bt.readline().decode('utf-8', errors='ignore').strip()
+        reading = parse_line(raw)
+
+        if reading is None:
+            continue
+
+        buffer.append(reading)
+        frame_count += 1
+
+        if len(buffer) < WINDOW_SIZE:
+            print(f"  warming up... {len(buffer)}/{WINDOW_SIZE}", end="\r")
+            continue
+
+        if frame_count % PREDICT_EVERY != 0:
+            continue
+
+        window_np = np.array(buffer, dtype=np.float32)
+
+        # Debug: print gyro_std to help tune thresholds
+        if DEBUG_GYRO:
+            gyro_std = np.std(window_np[:, 0]) + np.std(window_np[:, 1])
+            print(f"  gyro_std={gyro_std:.2f}  still<{STILL_THRESHOLD}  chaotic>{CHAOTIC_THRESHOLD}", end="\r")
+            continue
+
+        label = predict(window_np)
+
+        if debounce(label):
+            if label == "nothing":
+                print("  —  (idle)")
+            else:
+                exercise, form = label.split()
+                icon = "✓" if form == "good" else "✗"
+                print(f"{icon}  {label.upper()}")
+
+except serial.SerialException as e:
+    print(f"Serial error: {e}")
+
+except KeyboardInterrupt:
+    print("\nInterrupted.")
+
+finally:
+    if 'bt' in locals() and bt.is_open:
+        bt.close()
+    print("Connection closed.")
