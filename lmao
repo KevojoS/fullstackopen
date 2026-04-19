@@ -1,0 +1,188 @@
+import serial
+import time
+import keyboard
+import numpy as np
+import torch
+import torch.nn as nn
+import pickle
+from collections import deque
+
+# ─────────────────────────────────────────────
+# MODEL — must match training exactly
+# ─────────────────────────────────────────────
+class ExerciseNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv1d(12, 32, 3, padding=1),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, 3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+        )
+        self.lstm    = nn.LSTM(64, 64, batch_first=True, num_layers=2, dropout=0.3)
+        self.dropout = nn.Dropout(0.4)
+        self.fc = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 4)  # 4 classes
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.cnn(x)
+        x = x.permute(0, 2, 1)
+        _, (h, _) = self.lstm(x)
+        x = self.dropout(h[-1])
+        return self.fc(x)
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+PORT           = 'COM4'
+BAUD_RATE      = 9600
+CHECKPOINT     = "checkpoint.pkl"  # single file with model + scaler
+
+WINDOW_SIZE    = 24   # must match training
+NUM_FEATURES   = 12
+DEBOUNCE_N     = 3
+CONF_THRESHOLD = 0.7  # below this → "nothing"
+
+LABEL_DEC = {
+    0: ("curl",   "good"),
+    1: ("curl",   "bad"),
+    2: ("pushup", "good"),
+    3: ("pushup", "bad"),
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ─────────────────────────────────────────────
+# LOAD MODEL + SCALER from single pkl
+# ─────────────────────────────────────────────
+with open(CHECKPOINT, "rb") as f:
+    checkpoint = pickle.load(f)
+
+model = ExerciseNet().to(device)
+model.load_state_dict(checkpoint["model_state"])
+model.eval()
+
+scaler = checkpoint["scaler"]
+print("Model and scaler loaded.")
+
+# ─────────────────────────────────────────────
+# PARSE SERIAL LINE
+# ─────────────────────────────────────────────
+def parse_line(raw: str):
+    try:
+        parts = raw.split(",")
+        if len(parts) != NUM_FEATURES:
+            return None
+
+        values = [float(p.strip()) for p in parts]
+        arr = np.array(values, dtype=np.float32)
+
+        if not np.isfinite(arr).all():
+            return None
+
+        return arr
+
+    except (ValueError, IndexError):
+        return None
+
+# ─────────────────────────────────────────────
+# PREDICT
+# ─────────────────────────────────────────────
+@torch.no_grad()
+def predict(window_np):
+    if window_np.shape != (WINDOW_SIZE, NUM_FEATURES):
+        return None, None, 0.0
+
+    try:
+        x = scaler.transform(window_np).astype(np.float32)
+    except Exception:
+        return None, None, 0.0
+
+    x      = torch.tensor(x).unsqueeze(0).to(device)
+    logits = model(x)
+    probs  = torch.softmax(logits, dim=1)[0].cpu().numpy()
+
+    idx  = int(probs.argmax())
+    conf = float(probs[idx])
+
+    print(f"  probs: curl_good={probs[0]:.0%} curl_bad={probs[1]:.0%} "
+          f"pushup_good={probs[2]:.0%} pushup_bad={probs[3]:.0%}")
+
+    if conf < CONF_THRESHOLD:
+        return None, None, conf  # nothing
+
+    movement, form = LABEL_DEC[idx]
+    return movement, form, conf
+
+# ─────────────────────────────────────────────
+# DEBOUNCE
+# ─────────────────────────────────────────────
+recent_preds = deque(maxlen=DEBOUNCE_N)
+last_printed = None
+
+def debounce(movement, form):
+    global last_printed
+    label = (movement, form)
+    recent_preds.append(label)
+
+    if len(recent_preds) == DEBOUNCE_N and len(set(recent_preds)) == 1:
+        if label != last_printed:
+            last_printed = label
+            return True
+
+    return False
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
+buffer = deque(maxlen=WINDOW_SIZE)
+
+try:
+    bt = serial.Serial(PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print("Connected — waiting for data...")
+
+    while True:
+        if keyboard.is_pressed('esc'):
+            print("ESC pressed. Exiting...")
+            break
+
+        if bt.in_waiting == 0:
+            continue
+
+        raw     = bt.readline().decode('utf-8', errors='ignore').strip()
+        reading = parse_line(raw)
+
+        if reading is None:
+            continue
+
+        buffer.append(reading)
+
+        if len(buffer) < WINDOW_SIZE:
+            print(f"  warming up... {len(buffer)}/{WINDOW_SIZE}")
+            continue
+
+        window_np = np.array(buffer, dtype=np.float32)
+        movement, form, conf = predict(window_np)
+
+        if debounce(movement, form):
+            if movement is None:
+                print(f"  nothing (conf={conf:.0%})")
+            else:
+                print(f"{movement} — {form}  (conf={conf:.0%})")
+
+except serial.SerialException as e:
+    print(f"Serial error: {e}")
+
+except KeyboardInterrupt:
+    print("Interrupted.")
+
+finally:
+    if 'bt' in locals() and bt.is_open:
+        bt.close()
