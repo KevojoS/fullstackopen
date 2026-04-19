@@ -1,0 +1,240 @@
+import serial
+import time
+import keyboard
+import numpy as np
+from collections import deque, Counter
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+PORT               = 'COM4'
+BAUD_RATE          = 9600
+WINDOW_SIZE        = 24
+NUM_FEATURES       = 12
+DEBOUNCE_N         = 3
+CONF_THRESHOLD     = 0.6
+PREDICT_EVERY      = 6
+STILL_THRESHOLD    = 2.0
+CHAOTIC_THRESHOLD  = 18.0
+DEBUG_GYRO         = False  # set True to calibrate thresholds
+
+# Column order (must match Arduino output):
+# w_gx, w_gy, w_gz, w_ax, w_ay, w_az, s_gx, s_gy, s_gz, s_ax, s_ay, s_az
+
+# ─────────────────────────────────────────────
+# CLASS CENTROIDS  (computed from your training data)
+# Features: w_ax_mean, w_ay_mean, w_az_mean, w_ay_std, w_az_std,
+#           w_ay_range, w_az_range, s_ax_mean, s_ax_std, s_az_mean
+# ─────────────────────────────────────────────
+CENTROIDS = {
+    "curl good": {
+        "mean": [-5.0448, 4.5474, 3.5405, 2.216,  0.439,  7.0264, 1.5311, -5.0375, 2.9582, 3.6689],
+        "std":  [ 3.8411, 3.2597, 0.4555, 1.039,  0.3301, 3.1365, 1.2229,  3.8513, 2.0352, 1.8992],
+    },
+    "curl bad": {
+        "mean": [-4.4963, 3.702,  4.0278, 2.6951, 0.7216, 8.5605, 2.5063, -4.4932, 4.0281, 4.0292],
+        "std":  [ 4.6821, 2.858,  0.5124, 1.4234, 0.6503, 4.44,   2.4625,  4.6853, 2.6538, 0.5129],
+    },
+    "pushup good": {
+        "mean": [-8.9159, 0.4957, 1.759,  1.4344, 1.363,  4.8788, 4.7692, -8.908,  0.7997, 1.7451],
+        "std":  [ 0.4468, 2.7537, 0.9578, 0.9214, 1.0949, 3.5358, 4.2149,  0.4459, 0.7604, 0.9601],
+    },
+    "pushup bad": {
+        "mean": [-8.7741, 1.2706, 2.3533, 1.3628, 0.998,  4.4544, 3.3893, -8.7668, 0.8996, 2.352 ],
+        "std":  [ 0.7996, 2.6506, 1.615,  0.5936, 0.5985, 1.8985, 2.0381,  0.7955, 0.6274, 1.6179],
+    },
+}
+
+# ─────────────────────────────────────────────
+# NOTHING DETECTION
+# ─────────────────────────────────────────────
+def is_nothing(window: np.ndarray) -> bool:
+    w_gx = window[:, 0]
+    w_gy = window[:, 1]
+    gyro_std = np.std(w_gx) + np.std(w_gy)
+    return gyro_std < STILL_THRESHOLD or gyro_std > CHAOTIC_THRESHOLD
+
+# ─────────────────────────────────────────────
+# RULE-BASED CLASSIFIER
+# ─────────────────────────────────────────────
+def classify_window(window: np.ndarray) -> str:
+    w_ax = window[:, 3];  w_ay = window[:, 4];  w_az = window[:, 5]
+    s_ax = window[:, 9];  s_az = window[:, 11]
+
+    w_ax_mean  = w_ax.mean();  w_ay_mean  = w_ay.mean();  w_az_mean  = w_az.mean()
+    w_ay_std   = w_ay.std();   w_az_std   = w_az.std()
+    w_ay_range = w_ay.max() - w_ay.min()
+    w_az_range = w_az.max() - w_az.min()
+    s_ax_mean  = s_ax.mean();  s_ax_std   = s_ax.std();   s_az_mean  = s_az.mean()
+
+    if s_az_mean <= 2.73:
+        if w_ax_mean <= -8.19:
+            if w_ay_std <= 1.47:
+                return "pushup good"
+            else:
+                return "pushup bad" if w_ay_std <= 2.37 else "pushup good"
+        else:
+            if s_ax_std <= 1.98:
+                return "pushup bad"
+            else:
+                return "curl good" if w_az_std <= 1.41 else "curl bad"
+    else:
+        if w_az_mean <= 3.92:
+            if w_az_range <= 2.25:
+                return "curl good"
+            else:
+                return "pushup good" if w_ax_mean <= -8.39 else "curl bad"
+        else:
+            if w_ay_range <= 3.64:
+                return "curl bad" if s_ax_mean <= -8.94 else "pushup bad"
+            else:
+                return "curl good" if w_az_std <= 0.41 else "curl bad"
+
+# ─────────────────────────────────────────────
+# CONFIDENCE SCORING
+# Measures how close the window is to the predicted class centroid
+# relative to all other classes. Returns 0.0–1.0.
+# ─────────────────────────────────────────────
+def compute_confidence(window: np.ndarray, predicted_label: str) -> float:
+    w_ax = window[:, 3];  w_ay = window[:, 4];  w_az = window[:, 5]
+    s_ax = window[:, 9];  s_az = window[:, 11]
+
+    feats = np.array([
+        w_ax.mean(), w_ay.mean(), w_az.mean(),
+        w_ay.std(),  w_az.std(),
+        w_ay.max() - w_ay.min(),
+        w_az.max() - w_az.min(),
+        s_ax.mean(), s_ax.std(),
+        s_az.mean(),
+    ])
+
+    # Compute normalised Euclidean distance to each class centroid
+    distances = {}
+    for label, params in CENTROIDS.items():
+        mean = np.array(params["mean"])
+        std  = np.array(params["std"])
+        dist = np.sqrt(np.sum(((feats - mean) / std) ** 2))
+        distances[label] = dist
+
+    # Convert distances to confidence via softmin:
+    # closer distance = higher confidence
+    d_pred  = distances[predicted_label]
+    d_other = [v for k, v in distances.items() if k != predicted_label]
+    d_min_other = min(d_other)
+
+    # confidence = how much closer we are to predicted vs nearest rival
+    # clamped to [0, 1]
+    if d_pred == 0:
+        return 1.0
+    ratio = d_min_other / (d_pred + d_min_other)
+    return float(np.clip(ratio, 0.0, 1.0))
+
+# ─────────────────────────────────────────────
+# COMBINED PREDICT
+# ─────────────────────────────────────────────
+def predict(window: np.ndarray):
+    """Returns (label, confidence). label='nothing' if idle/chaotic."""
+    if is_nothing(window):
+        return "nothing", 1.0
+    label = classify_window(window)
+    conf  = compute_confidence(window, label)
+    return label, conf
+
+# ─────────────────────────────────────────────
+# PARSE SERIAL LINE
+# ─────────────────────────────────────────────
+def parse_line(raw: str):
+    try:
+        parts = raw.split(",")
+        if len(parts) != NUM_FEATURES:
+            return None
+        values = [float(p.strip()) for p in parts]
+        arr = np.array(values, dtype=np.float32)
+        if not np.isfinite(arr).all():
+            return None
+        return arr
+    except (ValueError, IndexError):
+        return None
+
+# ─────────────────────────────────────────────
+# DEBOUNCE
+# ─────────────────────────────────────────────
+recent_preds = deque(maxlen=DEBOUNCE_N)
+last_printed = None
+
+def debounce(label: str) -> bool:
+    global last_printed
+    recent_preds.append(label)
+    if len(recent_preds) < DEBOUNCE_N:
+        return False
+    counts               = Counter(recent_preds)
+    top_label, top_count = counts.most_common(1)[0]
+    confidence           = top_count / DEBOUNCE_N
+    if confidence >= CONF_THRESHOLD and top_label != last_printed:
+        last_printed = top_label
+        return True
+    return False
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
+buffer      = deque(maxlen=WINDOW_SIZE)
+frame_count = 0
+
+print(f"Connecting to {PORT} at {BAUD_RATE} baud...")
+
+try:
+    bt = serial.Serial(PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+    print("Connected — waiting for data. Press ESC to quit.\n")
+
+    while True:
+        if keyboard.is_pressed('esc'):
+            print("ESC pressed. Exiting...")
+            break
+
+        if bt.in_waiting == 0:
+            continue
+
+        raw     = bt.readline().decode('utf-8', errors='ignore').strip()
+        reading = parse_line(raw)
+        if reading is None:
+            continue
+
+        buffer.append(reading)
+        frame_count += 1
+
+        if len(buffer) < WINDOW_SIZE:
+            print(f"  warming up... {len(buffer)}/{WINDOW_SIZE}", end="\r")
+            continue
+
+        if frame_count % PREDICT_EVERY != 0:
+            continue
+
+        window_np = np.array(buffer, dtype=np.float32)
+
+        if DEBUG_GYRO:
+            gyro_std = np.std(window_np[:, 0]) + np.std(window_np[:, 1])
+            print(f"  gyro_std={gyro_std:.2f}  still<{STILL_THRESHOLD}  chaotic>{CHAOTIC_THRESHOLD}", end="\r")
+            continue
+
+        label, conf = predict(window_np)
+
+        if debounce(label):
+            if label == "nothing":
+                print("  —  (idle)")
+            else:
+                exercise, form = label.split()
+                icon = "✓" if form == "good" else "✗"
+                print(f"{icon}  {label.upper():<20} conf={conf:.0%}")
+
+except serial.SerialException as e:
+    print(f"Serial error: {e}")
+
+except KeyboardInterrupt:
+    print("\nInterrupted.")
+
+finally:
+    if 'bt' in locals() and bt.is_open:
+        bt.close()
+    print("Connection closed.")
